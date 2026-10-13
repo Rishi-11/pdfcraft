@@ -18,9 +18,8 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout your fork
+      - name: Checkout fork
         uses: actions/checkout@v4
 
       - name: Check latest upstream release
@@ -33,24 +32,24 @@ jobs:
             https://api.github.com/repos/storytold/pdfcraft/releases/latest \
             -o release.json
 
-          tag=$(jq -r '.tag_name' release.json)
-          previous=$(cat .upstream-release 2>/dev/null || true)
+          TAG=$(jq -er '.tag_name' release.json)
+          PREVIOUS=$(cat .upstream-release 2>/dev/null || true)
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          if [ "$tag" = "$previous" ]; then
+          if [ "$TAG" = "$PREVIOUS" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already deployed $tag"
+            echo "Already deployed: $TAG"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New release: $tag"
+            echo "New release detected: $TAG"
           fi
 
-      - name: Download web build
+      - name: Download and validate web release
         if: steps.release.outputs.changed == 'true'
-        shell: bash
         env:
           TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -58,45 +57,66 @@ jobs:
             "https://api.github.com/repos/storytold/pdfcraft/releases/tags/$TAG" \
             -o release.json
 
-          asset_url=$(jq -r '
+          ASSET_URL=$(jq -er '
             [.assets[]
-             | select(.name | test("^pdfcraft-web-.*\\.zip$"; "i"))]
+             | select(.name | test("^pdfcraft-web-[0-9][^/]*\\.zip$"; "i"))]
             | first
-            | .browser_download_url // empty
+            | .browser_download_url
           ' release.json)
 
-          if [ -z "$asset_url" ]; then
-            echo "No pdfcraft-web ZIP found for $TAG"
-            exit 1
-          fi
+          mkdir -p site
+          curl -fL --retry 3 "$ASSET_URL" -o web.zip
 
-          mkdir site
-          curl -fL "$asset_url" -o web.zip
+          # Reject an invalid or empty ZIP.
+          unzip -tq web.zip
           unzip -q web.zip -d site
 
+          # Find the application entry point.
           if [ ! -f site/index.html ]; then
-            index=$(find site -type f -name index.html -print -quit)
+            INDEX=$(find site -type f -name index.html -print -quit)
 
-            if [ -z "$index" ]; then
-              echo "The release ZIP has no index.html"
+            if [ -z "$INDEX" ]; then
+              echo "::error::Web ZIP does not contain index.html"
               exit 1
             fi
 
-            root="${index%/index.html}"
-            if [ "$root" != "site" ]; then
-              cp -a "$root"/. site/
-              rm -rf "$root"
+            ROOT="${INDEX%/index.html}"
+            if [ "$ROOT" != "site" ]; then
+              cp -a "$ROOT"/. site/
             fi
           fi
 
-          touch site/.nojekyll
-          echo "Downloaded release $TAG"
+          # Check for expected browser assets.
+          echo "=== Deployed file inventory ==="
+          find site -type f | head -100
 
-      - name: Configure Pages
+          echo "=== WASM and JavaScript assets ==="
+          find site -type f \
+            \( -name '*.wasm' -o -name '*.js' -o -name '*.mjs' \) \
+            -print | head -100
+
+          echo "=== OCR/model-related files ==="
+          if ! find site -type f \
+            | grep -Ei 'ocr|model|onnx|traineddata'; then
+            echo "No files with obvious OCR/model names found."
+          fi
+
+          # Prevent GitHub Pages from applying Jekyll processing.
+          touch site/.nojekyll
+
+          # Basic deployment sanity checks.
+          test -s site/index.html
+          test "$(du -sm site | cut -f1)" -gt 0
+
+          echo "Validated release: $TAG"
+          echo "Website size:"
+          du -sh site
+
+      - name: Configure GitHub Pages
         if: steps.release.outputs.changed == 'true'
         uses: actions/configure-pages@v5
 
-      - name: Upload website
+      - name: Upload Pages artifact
         if: steps.release.outputs.changed == 'true'
         uses: actions/upload-pages-artifact@v4
         with:
@@ -104,19 +124,24 @@ jobs:
 
       - name: Deploy website
         if: steps.release.outputs.changed == 'true'
-        id: deployment
         uses: actions/deploy-pages@v4
 
       - name: Record deployed version
         if: steps.release.outputs.changed == 'true'
         env:
           TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
           echo "$TAG" > .upstream-release
           git add .upstream-release
-          git commit -m "Record deployed PdfCraft release $TAG"
-          git push
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Record deployed PdfCraft release $TAG"
+            git push origin HEAD
+          fi
