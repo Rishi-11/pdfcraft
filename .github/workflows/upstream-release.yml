@@ -126,22 +126,11 @@ jobs:
         if: steps.release.outputs.changed == 'true'
         uses: actions/deploy-pages@v4
 
+     
       - name: Record deployed version
         if: steps.release.outputs.changed == 'true'
         env:
           TAG: ${{ steps.release.outputs.tag }}
-        shell: bash
         run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          echo "$TAG" > .upstream-release
-          git add .upstream-release
-
-          if ! git diff --cached --quiet; then
-            git commit -m "Record deployed PdfCraft release $TAG"
-            git push origin HEAD
-          fi
+          echo "Successfully deployed PdfCraft release $TAG"
+          echo "No version commit required."
