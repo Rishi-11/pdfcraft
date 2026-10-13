@@ -1,0 +1,122 @@
+
+name: Update PdfCraft from upstream release
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pdfcraft-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+
+      - name: Check latest upstream release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://api.github.com/repos/storytold/pdfcraft/releases/latest \
+            -o release.json
+
+          tag=$(jq -r '.tag_name' release.json)
+          previous=$(cat .upstream-release 2>/dev/null || true)
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$tag" = "$previous" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already deployed $tag"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New release: $tag"
+          fi
+
+      - name: Download web build
+        if: steps.release.outputs.changed == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            "https://api.github.com/repos/storytold/pdfcraft/releases/tags/$TAG" \
+            -o release.json
+
+          asset_url=$(jq -r '
+            [.assets[]
+             | select(.name | test("^pdfcraft-web-.*\\.zip$"; "i"))]
+            | first
+            | .browser_download_url // empty
+          ' release.json)
+
+          if [ -z "$asset_url" ]; then
+            echo "No pdfcraft-web ZIP found for $TAG"
+            exit 1
+          fi
+
+          mkdir site
+          curl -fL "$asset_url" -o web.zip
+          unzip -q web.zip -d site
+
+          if [ ! -f site/index.html ]; then
+            index=$(find site -type f -name index.html -print -quit)
+
+            if [ -z "$index" ]; then
+              echo "The release ZIP has no index.html"
+              exit 1
+            fi
+
+            root="${index%/index.html}"
+            if [ "$root" != "site" ]; then
+              cp -a "$root"/. site/
+              rm -rf "$root"
+            fi
+          fi
+
+          touch site/.nojekyll
+          echo "Downloaded release $TAG"
+
+      - name: Configure Pages
+        if: steps.release.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        if: steps.release.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy website
+        if: steps.release.outputs.changed == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Record deployed version
+        if: steps.release.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "$TAG" > .upstream-release
+          git add .upstream-release
+          git commit -m "Record deployed PdfCraft release $TAG"
+          git push
